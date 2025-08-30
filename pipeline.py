@@ -23,22 +23,28 @@ except Exception:  # 允许在无 requests 时仍能运行非 HTTP 探测
 # 目标端口与服务映射可以由 CLI 或配置覆盖
 DEFAULT_SPECIFIED_PORTS = [
     {"proto": "tcp", "port": 80},
-    {"proto": "udp", "port": 53},
+    # {"proto": "udp", "port": 53},
 ]
 
 DEFAULT_TARGET_SERVICES = [
     {"name": "ssh", "proto": "tcp", "port": 22},
-    {"name": "ftp", "proto": "tcp", "port": 21},
-    {"name": "mysql", "proto": "tcp", "port": 3306},
-    {"name": "http", "proto": "tcp", "port": 80},
+    # {"name": "ftp", "proto": "tcp", "port": 21},
+    # {"name": "mysql", "proto": "tcp", "port": 3306},
+    # {"name": "http", "proto": "tcp", "port": 80},
 ]
+
+run_timeout = 30
 
 RANDOM_HIGH_PORT_RANGE = (20000, 65535)
 
 
-def run(cmd: List[str], capture: bool = False, check: bool = True) -> subprocess.CompletedProcess:
+def run(cmd: List[str], capture: bool = False, check: bool = True, timeout: Optional[float] = None) -> Optional[subprocess.CompletedProcess]:
     logger.debug("$ {}", " ".join(cmd))
-    return subprocess.run(cmd, capture_output=capture, text=True, check=check)
+    try:
+        return subprocess.run(cmd, capture_output=capture, text=True, check=check, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning("命令超时（{} 秒）：{}", timeout, " ".join(cmd))
+        return None
 
 
 def ensure_output_dir(path: Path) -> None:
@@ -70,8 +76,13 @@ def which(name: str) -> Optional[str]:
 
 # ------------------------- 扫描器封装 -------------------------
 
-def zmap_scan(target_port: int, rate: int, iface: Optional[str], source_port: Optional[int], output: Path, exclude_file: Optional[Path] = None) -> Path:
+def zmap_scan(target_port: int, rate: int, iface: Optional[str], source_port: Optional[int], output: Path, exclude_file: Optional[Path] = None, target_ips: Optional[Path] = None) -> Path:
     ensure_output_dir(output.parent)
+    # 预创建输出文件，保证后续流程有文件可读
+    try:
+        output.touch(exist_ok=True)
+    except Exception:
+        pass
     cmd = [
         "zmap",
         "-p",
@@ -88,17 +99,34 @@ def zmap_scan(target_port: int, rate: int, iface: Optional[str], source_port: Op
         cmd += ["--source-port", str(source_port)]
     if exclude_file:
         cmd += ["-w", str(exclude_file)]
-    run(cmd)
+    if target_ips:
+        cmd += ["-w", str(target_ips)]
+    else:
+        cmd += ["0.0.0.0/0"]  # 默认扫描全网
+    run(cmd, timeout=run_timeout)
     return output
 
 
-def masscan_scan(target_port: int, rate: int, iface: Optional[str], source_port: Optional[int], output: Path, exclude_file: Optional[Path] = None) -> Path:
+def masscan_scan(target_port: int, rate: int, iface: Optional[str], source_port: Optional[int], output: Path, exclude_file: Optional[Path] = None, target_ips: Optional[Path] = None) -> Path:
     ensure_output_dir(output.parent)
     # masscan 输出支持 -oL（列表）或 -oJ（JSON）。这里使用 -oL，之后统一转 .csv 兼容 extract。
     out_list = output.with_suffix(".list")
+    # 预创建文件，避免超时/失败时后续读取报错
+    try:
+        out_list.touch(exist_ok=True)
+        output.touch(exist_ok=True)
+    except Exception:
+        pass
+    
+    # 确定扫描目标
+    if target_ips:
+        scan_target = f"@{target_ips}"  # masscan 使用 @file 语法指定IP列表
+    else:
+        scan_target = "0.0.0.0/0"  # 默认扫描全网
+    
     cmd = [
         "masscan",
-        "0.0.0.0/0",
+        scan_target,
         "-p",
         str(target_port),
         "--rate",
@@ -114,24 +142,26 @@ def masscan_scan(target_port: int, rate: int, iface: Optional[str], source_port:
         cmd += ["--source-port", str(source_port)]
     if exclude_file:
         cmd += ["--excludefile", str(exclude_file)]
-    run(cmd)
+    run(cmd, timeout=run_timeout)
     # 解析 -oL 为简单 CSV（ip,port）
-    with open(out_list, "r", encoding="utf-8", errors="ignore") as rf, open(output, "w", encoding="utf-8") as wf:
-        for line in rf:
-            if line.startswith("Host:"):
-                # 形如：Host: 1.2.3.4 () 80
-                parts = line.strip().split()
-                ip = parts[1]
-                wf.write(f"{ip},{target_port}\n")
+    if out_list.exists():
+        with open(out_list, "r", encoding="utf-8", errors="ignore") as rf, open(output, "w", encoding="utf-8") as wf:
+            for line in rf:
+                if line.startswith("Host:"):
+                    # 形如：Host: 1.2.3.4 () 80
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        ip = parts[1]
+                        wf.write(f"{ip},{target_port}\n")
     return output
 
 
-def scan_dispatch(cfg: ScanConfig, target_port: int, src_port: Optional[int], tag: str) -> Path:
+def scan_dispatch(cfg: ScanConfig, target_port: int, src_port: Optional[int], tag: str, target_ips: Optional[Path] = None) -> Path:
     out = cfg.output_dir / f"scan_{tag}_src{src_port or 'auto'}_to{target_port}.csv"
     if cfg.scanner == "zmap" or (cfg.scanner == "auto" and which("zmap")):
-        return zmap_scan(target_port=target_port, rate=cfg.rate, iface=cfg.iface, source_port=src_port, output=out, exclude_file=cfg.exclude_file)
+        return zmap_scan(target_port=target_port, rate=cfg.rate, iface=cfg.iface, source_port=src_port, output=out, exclude_file=cfg.exclude_file, target_ips=target_ips)
     if cfg.scanner == "masscan" or (cfg.scanner == "auto" and which("masscan")):
-        return masscan_scan(target_port=target_port, rate=cfg.rate, iface=cfg.iface, source_port=src_port, output=out, exclude_file=cfg.exclude_file)
+        return masscan_scan(target_port=target_port, rate=cfg.rate, iface=cfg.iface, source_port=src_port, output=out, exclude_file=cfg.exclude_file, target_ips=target_ips)
     raise RuntimeError("未找到可用扫描器：请安装 zmap 或 masscan 并加入 PATH，或用 --scanner 指定")
 
 
@@ -183,19 +213,6 @@ def probe_service(ip: str, svc_name: str, port: int) -> Optional[dict]:
     return None
 
 
-def extract_ips_from_csv(csv_file: Path) -> Path:
-    # csv: "ip,port"
-    ip_list = csv_file.parent / (csv_file.stem + ".ips")
-    with open(csv_file, "r", encoding="utf-8", errors="ignore") as f, open(ip_list, "w", encoding="utf-8") as w:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            ip = line.split(",")[0]
-            w.write(ip + "\n")
-    return ip_list
-
-
 def filter_ips_by_not_in(other: Path, base: Path, out: Path) -> Path:
     with open(base, "r") as fb:
         base_set = set(ip.strip() for ip in fb if ip.strip())
@@ -236,31 +253,46 @@ def run_all(output_dir: Path, rate: int, iface: Optional[str], exclude_file: Opt
 
     # 第一阶段
     logger.info("阶段1：从指定端口扫描目标端口，得到初始主机列表")
-    stage1_all_ips: List[Path] = []
+    stage1_all_csvs: List[Path] = []
     high_port = pick_random_high_port(cfg.seed)
+    
     for spec in cfg.specified_ports:
         for svc in cfg.target_services:
             if svc["proto"] != "tcp":
                 continue
-            csv1 = scan_dispatch(cfg, target_port=svc["port"], src_port=spec["port"], tag=f"p{spec['port']}_to_{svc['name']}{svc['port']}")
-            ips1 = extract_ips_from_csv(csv1)
-            csv2 = scan_dispatch(cfg, target_port=svc["port"], src_port=high_port, tag=f"high{high_port}_to_{svc['name']}{svc['port']}")
-            ips2 = extract_ips_from_csv(csv2)
-            remaining = filter_ips_by_not_in(other=ips2, base=ips1, out=cfg.output_dir / f"stage1_{svc['name']}_from_{spec['port']}_only.ips")
-            stage1_all_ips.append(remaining)
+            
+            # 第一步：从指定端口扫描目标端口，得到初始IP列表
+            initial_scan = scan_dispatch(cfg, target_port=svc["port"], src_port=spec["port"], tag=f"p{spec['port']}_to_{svc['name']}{svc['port']}")
+            
+            # 第二步：在初始IP列表范围内，用高端口进行扫描验证
+            if initial_scan.exists() and initial_scan.stat().st_size > 0:
+                # 用高端口扫描这些IP（只在初始IP列表范围内扫描）
+                high_port_scan = scan_dispatch(cfg, target_port=svc["port"], src_port=high_port, tag=f"high{high_port}_to_{svc['name']}{svc['port']}", target_ips=initial_scan)
+                
+                # 从初始列表中去除高端口扫描有响应的IP
+                remaining = filter_ips_by_not_in(other=high_port_scan, base=initial_scan, out=cfg.output_dir / f"stage1_{svc['name']}_from_{spec['port']}_only.csv")
+                stage1_all_csvs.append(remaining)
+            else:
+                # 如果初始扫描没有结果，直接使用空文件
+                empty_file = cfg.output_dir / f"stage1_{svc['name']}_from_{spec['port']}_only.csv"
+                empty_file.touch()
+                stage1_all_csvs.append(empty_file)
 
     # 合并 stage1 候选
-    union_stage1 = cfg.output_dir / "stage1_candidates.ips"
+    union_stage1 = cfg.output_dir / "stage1_candidates.csv"
     unique = set()
-    for f in stage1_all_ips:
+    for f in stage1_all_csvs:
         with open(f, "r") as rf:
-            for ip in rf:
-                ip = ip.strip()
+            for line in rf:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                ip = line.split(",")[0]
                 if ip:
                     unique.add(ip)
     with open(union_stage1, "w") as wf:
         for ip in sorted(unique):
-            wf.write(ip + "\n")
+            wf.write(f"{ip}\n")  # 只输出IP地址，不包含逗号和额外字段
 
     # 第二阶段：对候选主机的指定端口发应用层探测
     logger.info("阶段2：应用层探测候选主机")
@@ -269,12 +301,15 @@ def run_all(output_dir: Path, rate: int, iface: Optional[str], exclude_file: Opt
         for svc in cfg.target_services:
             if svc["proto"] != "tcp":
                 continue
-            ip_input = union_stage1
+            csv_input = union_stage1
             out_json = cfg.output_dir / f"stage2_{svc['name']}_on_{spec['port']}.jsonl"
             count = 0
-            with open(ip_input, "r") as rf, open(out_json, "w", encoding="utf-8") as wf:
+            with open(csv_input, "r") as rf, open(out_json, "w", encoding="utf-8") as wf:
                 for line in rf:
-                    ip = line.strip()
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    ip = line.split(",")[0]
                     if not ip:
                         continue
                     res = probe_service(ip, svc["name"], spec["port"])  # 指定端口=探测端口
@@ -291,11 +326,34 @@ def run_all(output_dir: Path, rate: int, iface: Optional[str], exclude_file: Opt
     for svc in cfg.target_services:
         if svc["proto"] != "tcp":
             continue
-        csv_verify = scan_dispatch(cfg, target_port=svc["port"], src_port=high_port2, tag=f"verify_high{high_port2}_to_{svc['name']}{svc['port']}")
-        ips_verify = extract_ips_from_csv(csv_verify)
-        verified_paths.append(ips_verify)
+        # 只在候选IP范围内进行高端口验证
+        csv_verify = scan_dispatch(cfg, target_port=svc["port"], src_port=high_port2, tag=f"verify_high{high_port2}_to_{svc['name']}{svc['port']}", target_ips=union_stage1)
+        verified_paths.append(csv_verify)
+
+    # 汇总最终通过验证的列表：从 stage1 合并候选中剔除第三阶段仍可命中的 IP
+    final_list = cfg.output_dir / "final_verified.csv"
+    verify_union: set[str] = set()
+    for vp in verified_paths:
+        if vp.exists():
+            with open(vp, "r") as vf:
+                for line in vf:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    ip = line.split(",")[0]
+                    if ip:
+                        verify_union.add(ip)
+    with open(union_stage1, "r") as uf, open(final_list, "w") as fw:
+        for line in uf:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            ip = line.split(",")[0]
+            if ip and ip not in verify_union:
+                fw.write(f"{ip}\n")  # 只输出IP地址
 
     logger.info("完成。输出路径位于: {}", cfg.output_dir.resolve())
+    logger.info("最终通过验证的列表: {} (共 {} 个)", final_list, sum(1 for _ in open(final_list)))
 
 
 if __name__ == "__main__":
